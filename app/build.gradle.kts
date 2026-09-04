@@ -15,7 +15,20 @@ android {
         versionName = "0.2.0-dev"
     }
 
+    signingConfigs {
+        create("localBridgeDev") {
+            storeFile = rootProject.file("signing/local-bridge-dev.keystore")
+            storePassword = "localbridge-dev"
+            keyAlias = "localbridge-dev"
+            keyPassword = "localbridge-dev"
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("localBridgeDev")
+        }
+
         release {
             isMinifyEnabled = false
             proguardFiles(
