@@ -1,8 +1,13 @@
 package io.github.goreg39.localbridge
 
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -30,18 +35,45 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 
 class MainActivity : ComponentActivity() {
-    private val uiState = mutableStateOf(ServerUiState())
-    private var server: LocalHttpServer? = null
+    private val uiState = mutableStateOf(BridgeServiceState())
+
     private lateinit var clipboardBridge: ClipboardBridge
+    private var bridgeService: BridgeService? = null
+    private var bindRequested = false
+
+    private val serviceStateListener: (BridgeServiceState) -> Unit = { state ->
+        runOnUiThread {
+            uiState.value = state
+        }
+    }
+
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val localBinder = binder as? BridgeService.LocalBinder ?: return
+            bridgeService = localBinder.service
+            bridgeService?.addStateListener(serviceStateListener)
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            bridgeService = null
+            bindRequested = false
+            uiState.value = uiState.value.copy(
+                status = BridgeServerStatus.ERROR,
+                address = null,
+                detail = "Связь с фоновым сервисом потеряна.",
+            )
+        }
+    }
 
     private val localNetworkPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
         if (granted) {
-            startServer()
+            startBridgeService()
         } else {
             uiState.value = uiState.value.copy(
-                status = ServerStatus.PERMISSION_REQUIRED,
+                status = BridgeServerStatus.PERMISSION_REQUIRED,
+                address = null,
                 detail = "Без доступа к локальной сети браузер другого устройства не сможет подключиться к телефону.",
             )
         }
@@ -58,7 +90,7 @@ class MainActivity : ComponentActivity() {
                     Scaffold { innerPadding ->
                         LocalBridgeScreen(
                             state = uiState.value,
-                            onRequestPermission = ::ensureLocalNetworkAccess,
+                            onToggleServer = ::toggleServer,
                             onSendClipboardToPc = ::sendClipboardToPc,
                             modifier = Modifier
                                 .fillMaxSize()
@@ -69,107 +101,120 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        ensureLocalNetworkAccess()
+        // Сохраняем удобное поведение MVP: при открытии приложения сервер стартует сам.
+        // После старта Activity больше не владеет жизненным циклом сервера.
+        ensureLocalNetworkAccessAndStart()
     }
 
-    override fun onDestroy() {
-        server?.stop()
-        server = null
-        super.onDestroy()
+    override fun onStart() {
+        super.onStart()
+        bindToRunningService(autoCreate = false)
     }
 
-    private fun ensureLocalNetworkAccess() {
+    override fun onStop() {
+        unbindFromBridgeService()
+        super.onStop()
+    }
+
+    private fun toggleServer() {
+        when (uiState.value.status) {
+            BridgeServerStatus.RUNNING,
+            BridgeServerStatus.RUNNING_NO_ADDRESS,
+            BridgeServerStatus.STARTING,
+            -> stopBridgeService()
+
+            BridgeServerStatus.STOPPED,
+            BridgeServerStatus.PERMISSION_REQUIRED,
+            BridgeServerStatus.ERROR,
+            -> ensureLocalNetworkAccessAndStart()
+        }
+    }
+
+    private fun ensureLocalNetworkAccessAndStart() {
         if (Build.VERSION.SDK_INT < ANDROID_17_API) {
-            startServer()
+            startBridgeService()
             return
         }
 
         if (checkSelfPermission(LOCAL_NETWORK_PERMISSION) == PackageManager.PERMISSION_GRANTED) {
-            startServer()
+            startBridgeService()
         } else {
             uiState.value = uiState.value.copy(
-                status = ServerStatus.PERMISSION_REQUIRED,
+                status = BridgeServerStatus.PERMISSION_REQUIRED,
+                address = null,
                 detail = "Нужно разрешение Android «Устройства поблизости / локальная сеть».",
             )
             localNetworkPermissionLauncher.launch(LOCAL_NETWORK_PERMISSION)
         }
     }
 
-    private fun startServer() {
-        if (server != null) return
-
+    private fun startBridgeService() {
         uiState.value = uiState.value.copy(
-            status = ServerStatus.STARTING,
-            detail = "Запускаю локальный HTTP-сервер…",
+            status = BridgeServerStatus.STARTING,
+            address = null,
+            detail = "Запускаю фоновый сервер…",
         )
 
-        val newServer = LocalHttpServer(
-            onClipboardFromPc = { text ->
-                runOnUiThread {
-                    clipboardBridge.writeText(text)
-                    uiState.value = uiState.value.copy(
-                        lastClipboardAction = "Получено с ПК: ${preview(text)}",
-                    )
-                }
-            },
-            onFatalError = { message ->
-                runOnUiThread {
-                    server = null
-                    uiState.value = uiState.value.copy(
-                        status = ServerStatus.ERROR,
-                        detail = "Сервер остановился: $message",
-                    )
-                }
-            },
-        )
+        val intent = Intent(this, BridgeService::class.java).setAction(BridgeService.ACTION_START)
 
         try {
-            newServer.start()
-            server = newServer
-
-            val ipv4 = LanAddressFinder.findBestIpv4()
-            uiState.value = if (ipv4 != null) {
-                uiState.value.copy(
-                    status = ServerStatus.RUNNING,
-                    address = "http://$ipv4:${LocalHttpServer.DEFAULT_PORT}",
-                    detail = "Откройте этот адрес в Edge на устройстве в той же локальной сети.",
-                )
-            } else {
-                uiState.value.copy(
-                    status = ServerStatus.RUNNING_NO_ADDRESS,
-                    address = null,
-                    detail = "Сервер запущен, но IPv4 Wi‑Fi или точки доступа пока не найден.",
-                )
-            }
+            startForegroundService(intent)
+            bindToRunningService(autoCreate = true)
         } catch (error: Exception) {
-            newServer.stop()
             uiState.value = uiState.value.copy(
-                status = ServerStatus.ERROR,
-                detail = "Не удалось запустить сервер: ${error.message ?: error.javaClass.simpleName}",
+                status = BridgeServerStatus.ERROR,
+                address = null,
+                detail = "Не удалось запустить сервис: ${error.message ?: error.javaClass.simpleName}",
             )
         }
     }
 
-    private fun sendClipboardToPc() {
-        val activeServer = server ?: return
-        val text = clipboardBridge.readText()
+    private fun stopBridgeService() {
+        bridgeService?.stopBridge()
+            ?: stopService(Intent(this, BridgeService::class.java))
 
-        if (text.isNullOrEmpty()) {
+        uiState.value = uiState.value.copy(
+            status = BridgeServerStatus.STOPPED,
+            address = null,
+            detail = "Сервер остановлен пользователем.",
+        )
+    }
+
+    private fun bindToRunningService(autoCreate: Boolean) {
+        if (bindRequested) return
+
+        val flags = if (autoCreate) Context.BIND_AUTO_CREATE else 0
+        val didBind = bindService(
+            Intent(this, BridgeService::class.java),
+            serviceConnection,
+            flags,
+        )
+
+        if (didBind) {
+            bindRequested = true
+        }
+    }
+
+    private fun unbindFromBridgeService() {
+        if (!bindRequested) return
+
+        bridgeService?.removeStateListener(serviceStateListener)
+        runCatching { unbindService(serviceConnection) }
+        bridgeService = null
+        bindRequested = false
+    }
+
+    private fun sendClipboardToPc() {
+        val service = bridgeService
+        if (service == null) {
             uiState.value = uiState.value.copy(
-                lastClipboardAction = "Буфер телефона пуст или недоступен.",
+                lastClipboardAction = "Фоновый сервер недоступен. Запустите сервер и повторите.",
             )
             return
         }
 
-        activeServer.publishClipboardFromPhone(text)
-        uiState.value = uiState.value.copy(
-            lastClipboardAction = "Отправлено на ПК: ${preview(text)}",
-        )
-    }
-
-    private fun preview(text: String): String {
-        val oneLine = text.replace('\n', ' ').replace('\r', ' ').trim()
-        return if (oneLine.length <= 72) oneLine else oneLine.take(69) + "…"
+        // Чтение clipboard остаётся здесь, в видимой Activity, по явному нажатию пользователя.
+        service.publishClipboardFromPhone(clipboardBridge.readText())
     }
 
     companion object {
@@ -178,28 +223,16 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private data class ServerUiState(
-    val status: ServerStatus = ServerStatus.STARTING,
-    val address: String? = null,
-    val detail: String = "Подготовка…",
-    val lastClipboardAction: String = "Передача текста ещё не выполнялась.",
-)
-
-private enum class ServerStatus {
-    STARTING,
-    RUNNING,
-    RUNNING_NO_ADDRESS,
-    PERMISSION_REQUIRED,
-    ERROR,
-}
-
 @Composable
 private fun LocalBridgeScreen(
-    state: ServerUiState,
-    onRequestPermission: () -> Unit,
+    state: BridgeServiceState,
+    onToggleServer: () -> Unit,
     onSendClipboardToPc: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val serverRunning = state.status == BridgeServerStatus.RUNNING ||
+        state.status == BridgeServerStatus.RUNNING_NO_ADDRESS
+
     Column(
         modifier = modifier.padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -215,17 +248,18 @@ private fun LocalBridgeScreen(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(
-                text = if (state.status == ServerStatus.RUNNING) "●" else "○",
+                text = if (serverRunning) "●" else "○",
                 style = MaterialTheme.typography.titleLarge,
             )
             Column {
                 Text(
                     text = when (state.status) {
-                        ServerStatus.STARTING -> "Сервер запускается"
-                        ServerStatus.RUNNING -> "Сервер запущен"
-                        ServerStatus.RUNNING_NO_ADDRESS -> "Сервер запущен"
-                        ServerStatus.PERMISSION_REQUIRED -> "Нужен доступ к локальной сети"
-                        ServerStatus.ERROR -> "Ошибка сервера"
+                        BridgeServerStatus.STOPPED -> "Сервер остановлен"
+                        BridgeServerStatus.STARTING -> "Сервер запускается"
+                        BridgeServerStatus.RUNNING -> "Сервер работает"
+                        BridgeServerStatus.RUNNING_NO_ADDRESS -> "Сервер работает"
+                        BridgeServerStatus.PERMISSION_REQUIRED -> "Нужен доступ к локальной сети"
+                        BridgeServerStatus.ERROR -> "Ошибка сервера"
                     },
                     fontWeight = FontWeight.SemiBold,
                 )
@@ -243,13 +277,18 @@ private fun LocalBridgeScreen(
             }
         }
 
-        if (state.status == ServerStatus.PERMISSION_REQUIRED) {
-            Button(
-                onClick = onRequestPermission,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("РАЗРЕШИТЬ ДОСТУП К ЛОКАЛЬНОЙ СЕТИ")
-            }
+        Button(
+            onClick = onToggleServer,
+            enabled = state.status != BridgeServerStatus.STARTING,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                when {
+                    serverRunning -> "ОСТАНОВИТЬ СЕРВЕР"
+                    state.status == BridgeServerStatus.PERMISSION_REQUIRED -> "РАЗРЕШИТЬ И ЗАПУСТИТЬ СЕРВЕР"
+                    else -> "ЗАПУСТИТЬ СЕРВЕР"
+                },
+            )
         }
 
         Spacer(modifier = Modifier.height(8.dp))
@@ -263,7 +302,7 @@ private fun LocalBridgeScreen(
 
         Button(
             onClick = onSendClipboardToPc,
-            enabled = state.status == ServerStatus.RUNNING || state.status == ServerStatus.RUNNING_NO_ADDRESS,
+            enabled = serverRunning,
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("ОТПРАВИТЬ БУФЕР НА ПК")
