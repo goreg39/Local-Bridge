@@ -32,6 +32,7 @@ import androidx.compose.ui.unit.dp
 class MainActivity : ComponentActivity() {
     private val uiState = mutableStateOf(ServerUiState())
     private var server: LocalHttpServer? = null
+    private lateinit var clipboardBridge: ClipboardBridge
 
     private val localNetworkPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -39,7 +40,7 @@ class MainActivity : ComponentActivity() {
         if (granted) {
             startServer()
         } else {
-            uiState.value = ServerUiState(
+            uiState.value = uiState.value.copy(
                 status = ServerStatus.PERMISSION_REQUIRED,
                 detail = "Без доступа к локальной сети браузер другого устройства не сможет подключиться к телефону.",
             )
@@ -49,6 +50,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        clipboardBridge = ClipboardBridge(this)
 
         setContent {
             MaterialTheme {
@@ -57,6 +59,7 @@ class MainActivity : ComponentActivity() {
                         LocalBridgeScreen(
                             state = uiState.value,
                             onRequestPermission = ::ensureLocalNetworkAccess,
+                            onSendClipboardToPc = ::sendClipboardToPc,
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(innerPadding),
@@ -84,7 +87,7 @@ class MainActivity : ComponentActivity() {
         if (checkSelfPermission(LOCAL_NETWORK_PERMISSION) == PackageManager.PERMISSION_GRANTED) {
             startServer()
         } else {
-            uiState.value = ServerUiState(
+            uiState.value = uiState.value.copy(
                 status = ServerStatus.PERMISSION_REQUIRED,
                 detail = "Нужно разрешение Android «Устройства поблизости / локальная сеть».",
             )
@@ -95,16 +98,24 @@ class MainActivity : ComponentActivity() {
     private fun startServer() {
         if (server != null) return
 
-        uiState.value = ServerUiState(
+        uiState.value = uiState.value.copy(
             status = ServerStatus.STARTING,
             detail = "Запускаю локальный HTTP-сервер…",
         )
 
         val newServer = LocalHttpServer(
+            onClipboardFromPc = { text ->
+                runOnUiThread {
+                    clipboardBridge.writeText(text)
+                    uiState.value = uiState.value.copy(
+                        lastClipboardAction = "Получено с ПК: ${preview(text)}",
+                    )
+                }
+            },
             onFatalError = { message ->
                 runOnUiThread {
                     server = null
-                    uiState.value = ServerUiState(
+                    uiState.value = uiState.value.copy(
                         status = ServerStatus.ERROR,
                         detail = "Сервер остановился: $message",
                     )
@@ -118,24 +129,47 @@ class MainActivity : ComponentActivity() {
 
             val ipv4 = LanAddressFinder.findBestIpv4()
             uiState.value = if (ipv4 != null) {
-                ServerUiState(
+                uiState.value.copy(
                     status = ServerStatus.RUNNING,
                     address = "http://$ipv4:${LocalHttpServer.DEFAULT_PORT}",
                     detail = "Откройте этот адрес в Edge на устройстве в той же локальной сети.",
                 )
             } else {
-                ServerUiState(
+                uiState.value.copy(
                     status = ServerStatus.RUNNING_NO_ADDRESS,
+                    address = null,
                     detail = "Сервер запущен, но IPv4 Wi‑Fi или точки доступа пока не найден.",
                 )
             }
         } catch (error: Exception) {
             newServer.stop()
-            uiState.value = ServerUiState(
+            uiState.value = uiState.value.copy(
                 status = ServerStatus.ERROR,
                 detail = "Не удалось запустить сервер: ${error.message ?: error.javaClass.simpleName}",
             )
         }
+    }
+
+    private fun sendClipboardToPc() {
+        val activeServer = server ?: return
+        val text = clipboardBridge.readText()
+
+        if (text.isNullOrEmpty()) {
+            uiState.value = uiState.value.copy(
+                lastClipboardAction = "Буфер телефона пуст или недоступен.",
+            )
+            return
+        }
+
+        activeServer.publishClipboardFromPhone(text)
+        uiState.value = uiState.value.copy(
+            lastClipboardAction = "Отправлено на ПК: ${preview(text)}",
+        )
+    }
+
+    private fun preview(text: String): String {
+        val oneLine = text.replace('\n', ' ').replace('\r', ' ').trim()
+        return if (oneLine.length <= 72) oneLine else oneLine.take(69) + "…"
     }
 
     companion object {
@@ -148,6 +182,7 @@ private data class ServerUiState(
     val status: ServerStatus = ServerStatus.STARTING,
     val address: String? = null,
     val detail: String = "Подготовка…",
+    val lastClipboardAction: String = "Передача текста ещё не выполнялась.",
 )
 
 private enum class ServerStatus {
@@ -162,6 +197,7 @@ private enum class ServerStatus {
 private fun LocalBridgeScreen(
     state: ServerUiState,
     onRequestPermission: () -> Unit,
+    onSendClipboardToPc: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -193,10 +229,7 @@ private fun LocalBridgeScreen(
                     },
                     fontWeight = FontWeight.SemiBold,
                 )
-                Text(
-                    text = state.detail,
-                    style = MaterialTheme.typography.bodySmall,
-                )
+                Text(text = state.detail, style = MaterialTheme.typography.bodySmall)
             }
         }
 
@@ -229,17 +262,14 @@ private fun LocalBridgeScreen(
         )
 
         Button(
-            onClick = {},
-            enabled = false,
+            onClick = onSendClipboardToPc,
+            enabled = state.status == ServerStatus.RUNNING || state.status == ServerStatus.RUNNING_NO_ADDRESS,
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("ОТПРАВИТЬ БУФЕР НА ПК")
         }
 
-        Text(
-            text = "Сначала проверяем прямое подключение браузера к телефону. После PASS добавим обмен текстом.",
-            style = MaterialTheme.typography.bodySmall,
-        )
+        Text(text = state.lastClipboardAction, style = MaterialTheme.typography.bodySmall)
 
         HorizontalDivider()
 
